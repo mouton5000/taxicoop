@@ -1,21 +1,32 @@
 import argparse
+import copy
 import csv
 import logging
+import pickle
 import sys
+import time
 from typing import Callable, Dict, List, Tuple
+
+from matplotlib import pyplot as plt
 
 from request import Request
 from solution import Solution
 from taxi import Taxi
-from utils import request2coordinates, time
+from utils import request2coordinates, travel_time
 
 
 def setup():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("-i", "--input", required=True,
+    parser.add_argument("-i", "--input", type=str,
+                        help="Path to the dataset of taxi requests.")
+    parser.add_argument("--checkpoint-dataset", type=str, required=True,
                         help="Path to the dataset of taxi requests.")
     parser.add_argument("-s", "--size", type=int, default=None,
                         help="Maximum size of the dataset to import.")
+    parser.add_argument("-w", "--time-window", type=int, default=15,
+                        help="Length of the time windows for both pick up and drop off points.")
+    parser.add_argument("--data-saved", action="store_true",
+                        help="Load a static instance of the DARP-M with 4298 requests on 30 sec.")
     parser.add_argument("-t", "--timeframe", type=int, default=1000,
                         help="Time length of a static instance (sec).")
     parser.add_argument("--speed", type=int, default=40,
@@ -24,8 +35,18 @@ def setup():
                         help="Seat capacity of each taxi, driver not included.")
     parser.add_argument("--alpha", type=float, default=1,
                         help="Customer are paying less than an individual ride times alpha.")
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="Size of the Restricted Candidate List (RCL) in the insertion method.")
     parser.add_argument("--num-GRASP", type=int, default=10,
                         help="Maximum number of iterations of the GRASP heuristic.")
+    parser.add_argument("--num-local-search", type=int, default=10,
+                        help="Maximum number of iterations in the local search.")
+    parser.add_argument("--insertion-method", type=str, default="IA", choices=("IA", "IB"),
+                        help="Type of insertion method to use."
+                              "IA stands for the exhaustive method."
+                              "IB stands for the heuristic method.")
+    parser.add_argument("--test-size", type=int, default=200,
+                        help="Number of requests to consider to test the algorithm.")
     logging.basicConfig(level=logging.INFO)
     args = parser.parse_args()
     return args
@@ -76,14 +97,17 @@ def read_dataset(path: str, size: int=None, time_window: int=15) -> List[List[Tu
             DO_coordinates = (float(row[9]), float(row[10]))
             # we do not use the DO datetime from the dataset because we use distances
             # the distance as the crow flies with constant speed
-            DO_datetime = PU_datetime + time(PU_coordinates, DO_coordinates)
+            DO_datetime = PU_datetime + travel_time(PU_coordinates, DO_coordinates)
 
             request = []
             request.append((PU_datetime - time_window*60, PU_datetime))
             request.append((DO_datetime, DO_datetime + time_window*60))
             request.append(PU_coordinates)
             request.append(DO_coordinates)
-            dataset.append(request)
+            
+            # filtering
+            if PU_coordinates[0] != 0 and DO_coordinates[0] != 0 and DO_datetime - PU_datetime < 12*3600:
+                dataset.append(request)
 
         # sort the requests by Pick-Up datetime
         dataset_sorted = sorted(dataset, key=lambda x: x[0][0])
@@ -101,7 +125,7 @@ def initialize_requests(dataset, timeframe: int) -> List:
     log.info("Origin datetime : %d" % t_0)
     for i, req in enumerate(dataset):
         request = Request(req, i+1)
-        if request.PU_datetime()[0] < t_0 + timeframe:
+        if request.PU_datetime[0] < t_0 + timeframe:
             requests.append(request)
         else:
             break
@@ -110,35 +134,58 @@ def initialize_requests(dataset, timeframe: int) -> List:
     return requests
 
 
-def path_relinking(s1, s2):
-    """
-    TODO
-    """
-
-
 def main():
     args = setup()
-    dataset = read_dataset(args.input, args.size)
-    requests = initialize_requests(dataset, timeframe=args.timeframe)
+    if args.data_saved:
+        with open(args.checkpoint_dataset, "rb") as f:
+            requests = pickle.load(f)
+    else:
+        dataset = read_dataset(args.input, args.size, args.time_window)
+        requests = initialize_requests(dataset, timeframe=args.timeframe)
+        with open(args.checkpoint_dataset, "wb") as f:
+            pickle.dump(requests, f)
 
     print("Starting GRASP iterations...")
+    time_start = time.clock()
+    elite_solution = None
     for i in range(args.num_GRASP):
-        print("----- Iteration :", i+1)
-        solution = Solution(requests)
-        solution.build_initial_solution(beta=0.5)
-        for i, taxi in enumerate(solution.taxis):
-            print("number of requests served by taxi %d : %d" % (i, int(len(taxi.route)/2)))
-        nb_shared_rides = solution.compute_objective_function()
-        print("Number of shared rides :", nb_shared_rides)
-        print("Local search performed...")
-        next_solution = solution.local_search()
-        #next_solution = Neighborhood(solution)
-        #print("2 :", next_solution.taxis)
-        #next_solution.local_search()
-        #next_nb_shared_rides = next_solution.compute_objective_function(nb_requests)
-        #print("Number of shared rides :", next_nb_shared_rides)
-        # solution = path_relinking(s1, s2)
-        # solution.local_search()
+        print()
+        print("----- Iteration %d -----" % (i+1))
+        init_solution = Solution(requests[:args.test_size])
+        init_solution.build_initial_solution(args.insertion_method, beta=args.beta)
+
+        init_obj = init_solution.compute_obj
+        print("Obj init :", init_obj)
+        if init_obj == init_solution.nb_requests:
+            elite_solution = copy.deepcopy(init_solution)
+            elite_obj = init_obj
+            break
+
+        print("1. Local Search :", init_obj)
+        ls_solution, ls_obj = init_solution.local_search(args.insertion_method, args.num_local_search)
+        if ls_obj == ls_solution.nb_requests:
+            elite_solution = copy.deepcopy(ls_solution)
+            elite_obj = ls_obj
+            break
+        
+        if elite_solution:
+            print("2. Path Relinking :", ls_obj)
+            pr_solution, pr_obj = ls_solution.path_relinking(elite_solution, args.insertion_method)
+            print("3. Second Local Search :", pr_obj)
+            ls_pr_solution, ls_pr_obj = pr_solution.local_search(args.insertion_method, args.num_local_search)
+            if ls_pr_obj > elite_obj:
+                elite_solution = copy.deepcopy(ls_pr_solution)
+                elite_obj = ls_pr_obj
+        else:
+            elite_solution = copy.deepcopy(ls_solution)
+            elite_obj = ls_obj
+        print()
+        print("Elite obj :", elite_obj)
+
+    print("Best obj after %d iterations of the GRASP heuristic : %d" % (args.num_GRASP, elite_obj))
+
+    time_elapsed = (time.clock() - time_start)
+    print("Computation time :", round(time_elapsed, 2))
 
 
 if __name__ == "__main__":

@@ -15,14 +15,18 @@ class Request:
         self.id = id
         self.passengers = passengers
 
+    @property
     def PU_datetime(self) -> Tuple[int]:
         return self._row[0]
 
+    @property
     def DO_datetime(self) -> Tuple[int]:
         return self._row[1]
 
+    @property
     def PU_coordinates(self) -> Tuple[float]:
         return self._row[2]
 
+    @property
     def DO_coordinates(self) -> Tuple[float]:
         return self._row[3]
