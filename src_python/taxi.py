@@ -1,12 +1,16 @@
 import copy
-from typing import Callable, List
+from typing import Callable
+
+from collections import defaultdict
+from haversine import haversine
 
 from utils import travel_time
 
 
 # types of insertion methods
-IA = "IA" # exhaustive method
-IB = "IB" # heuristic method
+IA = "IA"  # exhaustive method
+IB = "IB"  # heuristic method
+
 
 class Taxi:
 
@@ -24,7 +28,7 @@ class Taxi:
         self.capacity = capacity
         self.speed = speed
 
-    def insert(self, request: Callable, method: str):
+    def insert(self, request: Callable, alpha: float, method: str):
         """
         Insertion methods describe in Santos 2015.
         IA stands for the exhaustive  method.
@@ -41,7 +45,7 @@ class Taxi:
                     route2 = copy.deepcopy(route1)
                     route2.insert(do, [request.PU_datetime[0] + travel_time(request.PU_coordinates, request.DO_coordinates),
                                   request, request.DO_coordinates])
-                    valid = self.is_valid(route2)
+                    valid = self.is_valid(route=route2, alpha=alpha)
                     if valid:
                         self.route = route2
                         return
@@ -56,9 +60,9 @@ class Taxi:
                     route2 = copy.deepcopy(route1)
                     route2.insert(do, [request.PU_datetime[0] + travel_time(request.PU_coordinates, request.DO_coordinates),
                                   request, request.DO_coordinates])
-                    valid = self.is_valid(route2)
-                    if valid and self.delay(route2) < cur_delay:
-                        cur_delay = self.delay(route2)
+                    valid = self.is_valid(route=route2, alpha=alpha)
+                    if valid and self.delay(route=route2) < cur_delay:
+                        cur_delay = self.delay(route=route2)
                         route3 = route2
             try:
                 self.route = route3
@@ -66,14 +70,15 @@ class Taxi:
             except UnboundLocalError:
                 raise Exception("could not insert request %d into the route %s" % (request.id, self.route))
 
-    def remove(self, request: int):
+    def remove(self, request_id: int):
         """
         Removes the input request from the route.
         """
-        self.route = [req for req in self.route if req[1].id != request]
+        self.route = [req for req in self.route if req[1].id != request_id]
 
-    def swap(self, pos1: int, pos2: int):
+    def swap(self, pos1: int, pos2: int, alpha: float):
         """
+        Function currently not used.
         Function to swap points in pos1 and pos2 in the route if valid.
         """
         route = copy.deepcopy(self.route)
@@ -90,9 +95,9 @@ class Taxi:
             served_requests.append(route[i][1].id)
 
         try:  
-            self.is_valid(route)
+            self.is_valid(route=route, alpha=alpha)
             self.update_delivery_datetimes(route)
-            self.is_valid(route)
+            self.is_valid(route=route, alpha=alpha)
             self.route = route
         except Exception:
             raise Exception("could not swap point %d and point %d in route %s" % (pos1, pos2, self.route))
@@ -112,30 +117,55 @@ class Taxi:
         assert delay >= 0
         return delay
 
-    def get_loading_timeline(self, route) -> List[int]:
-        """
-        Returns the loading timeline of the taxi through its travel.
-        """
-        served_request = []
-        loading_timeline = [0]
-        for x in route:
-            if x[1].id not in served_request:
-                loading_timeline.append(loading_timeline[-1] + 1)
-                served_request.append(x[1].id)
+    @property
+    def individual_stats(self):
+        on_board = []
+        individual_delays = defaultdict(int)
+        individual_economies_per = defaultdict(int)
+        coordinates = defaultdict(list)
+        for i, point in enumerate(self.route[:-1]):
+            time = travel_time(self.route[i][2], self.route[i+1][2])
+            cost = haversine(self.route[i][2], self.route[i+1][2])
+            if point[1].id not in on_board:
+                on_board.append(point[1].id)
+                coordinates[point[1].id].append(point[2])
             else:
-                loading_timeline.append(loading_timeline[-1] - 1)
+                on_board.remove(point[1].id)
+                coordinates[point[1].id].append(point[2])
+            for r_id in on_board:
+                individual_delays[r_id] += time
+                individual_economies_per[r_id] += cost / len(on_board)
+        coordinates[self.route[-1][1].id].append(self.route[-1][2])
 
-        assert len(loading_timeline) == len(route) + 1
-        assert loading_timeline[-1] == 0
-        return loading_timeline
+        assert len (individual_delays) == len(individual_economies_per)
+        assert len(on_board) == 1
+        assert [len(t) for t in coordinates.values()] == [2 for _ in range(int(len(self.route) / 2))]
 
-    def is_valid(self, route) -> bool:
+        individual_delays_per = copy.deepcopy(individual_delays)
+        for r_id in individual_delays.keys():
+            time = travel_time(coordinates[r_id][0], coordinates[r_id][1])
+            cost = haversine(coordinates[r_id][0], coordinates[r_id][1])
+            
+            individual_delays[r_id] -= time
+            individual_delays_per[r_id] -= time
+            assert individual_delays[r_id] >= 0
+            individual_delays_per[r_id] = individual_delays_per[r_id]*100 / time
+
+            individual_economies_per[r_id] -= cost
+            assert individual_economies_per[r_id] <= 0
+            individual_economies_per[r_id] = abs(individual_economies_per[r_id])*100 / cost
+        return individual_delays, individual_delays_per, individual_economies_per
+
+    def is_valid(self, route, alpha: float) -> bool:
         """
         Checks the validity of the route according to the following constraints :
             1. The capacity constraint
             2. No stops permitted in the taxi's route
-            3. The time windows of the passengers
+            3. The cost constraint
+            4. The time windows of the passengers
         """
+        #print()
+        #print("route :", [p[1].id for p in route])
         served_request = []
         loading_timeline = [0]
         for i, x in enumerate(route):
@@ -155,7 +185,30 @@ class Taxi:
         assert len(loading_timeline) == len(route) + 1
         assert loading_timeline[-1] == 0
 
-        # The time windows of the passengers
+        # 3. The cost constraint
+        travel_costs = defaultdict(int)
+        coordinates = defaultdict(list)
+        on_board = []
+        for i, point in enumerate(route[:-1]):
+            cost = haversine(route[i][2], route[i+1][2])
+            if point[1].id not in on_board:
+                on_board.append(point[1].id)
+                coordinates[point[1].id].append(point[2])
+            else:
+                on_board.remove(point[1].id)
+                coordinates[point[1].id].append(point[2])
+            for r_id in on_board:
+                travel_costs[r_id] += cost / len(on_board)
+        coordinates[route[-1][1].id].append(route[-1][2])
+        
+        assert len(on_board) == 1
+        assert [len(t) for t in coordinates.values()] == [2 for _ in range(int(len(route) / 2))]
+
+        for r_id, cost in travel_costs.items():
+            if cost > haversine(coordinates[r_id][0], coordinates[r_id][1]) * alpha:
+                return False
+
+        # 4. The time windows of the passengers
         served_requests = []
         for i in range(len(route) - 1):
             # updates the delivery datetimes of the route after the insertions
@@ -174,5 +227,4 @@ class Taxi:
         # last point of the route
         if route[-1][0] > route[-1][1].DO_datetime[1]:
             return False
-        #print("True")
         return True
